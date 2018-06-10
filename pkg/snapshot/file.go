@@ -69,7 +69,10 @@ func (s *containerDirectoryWatcher) Serve() error {
 
 	s.stopCh = make(chan struct{})
 	tracker := newContainerSnapshotTracker(s.snapshotter)
-	go tracker.Run(s.stopCh)
+	// run two tracker workers
+	for i := 0; i < 2; i++ {
+		go tracker.Run(s.stopCh)
+	}
 
 	s.tracker = tracker
 	s.stopped = false

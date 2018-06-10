@@ -14,7 +14,7 @@ import (
 
 type containerSnapshotOp struct {
 	snapshotter   notifier.ContainerSnapshotter
-	fromContainer string
+	containerName string
 	podUID        string
 	filename      string
 	path          string
@@ -22,15 +22,16 @@ type containerSnapshotOp struct {
 
 	// only used by the tracker while under its lock
 	clear     bool
+	running   bool
 	completed bool
 	pending   <-chan struct{}
 }
 
-func newContainerSnapshotOp(snapshotter notifier.ContainerSnapshotter, podUID, fromContainer, filename, path string, condition notifier.ConditionType) *containerSnapshotOp {
+func newContainerSnapshotOp(snapshotter notifier.ContainerSnapshotter, podUID, containerName, filename, path string, condition notifier.ConditionType) *containerSnapshotOp {
 	return &containerSnapshotOp{
 		snapshotter:   snapshotter,
 		podUID:        podUID,
-		fromContainer: fromContainer,
+		containerName: containerName,
 		filename:      filename,
 		path:          path,
 		condition:     condition,
@@ -39,19 +40,19 @@ func newContainerSnapshotOp(snapshotter notifier.ContainerSnapshotter, podUID, f
 
 type SnapshotError struct {
 	Status        string `json:"status"`
-	FromContainer string `json:"fromContainer"`
+	FromContainer string `json:"containerName"`
 	Message       string `json:"message"`
 }
 
 func (c *containerSnapshotOp) Run() error {
-	statusPath := filepath.Join(c.path, c.fromContainer) + resultFileSuffix
+	statusPath := filepath.Join(c.path, c.containerName) + resultFileSuffix
 	if err := os.Remove(statusPath); err != nil && !os.IsNotExist(err) {
 		glog.Errorf("Unable to remove existing JSON status for client: %v", err)
 	}
 
 	result := &SnapshotError{
 		Status:        "Success",
-		FromContainer: c.fromContainer,
+		FromContainer: c.containerName,
 	}
 
 	err := c.writeSnapshot()
@@ -79,7 +80,7 @@ func (c *containerSnapshotOp) writeSnapshot() error {
 
 	var isNamedPipe bool
 	err := func() error {
-		in, err := c.snapshotter.Snapshot(c.condition, c.podUID, c.fromContainer)
+		in, err := c.snapshotter.Snapshot(c.condition, c.podUID, c.containerName)
 		if err != nil {
 			return err
 		}

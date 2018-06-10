@@ -108,6 +108,7 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 				for k, oldPod := range n.pods {
 					newPod, ok := newPods[k]
 					if !ok {
+						glog.V(5).Infof("Sync: old pod %#v removed", k)
 						// the entire pod has been removed, remove all containers
 						for _, oldContainer := range oldPod.Containers {
 							if oldContainer.Mount {
@@ -140,8 +141,18 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 					// notify for all newly added containers to existing pods
 					for name, newContainer := range newPod.Containers {
 						if _, ok := oldPod.Containers[name]; !ok {
+							glog.V(5).Infof("Sync: New container %s in pod %#v", name, k)
 							if newContainer.Mount {
 								n.notifier.MountAdded(newContainer.Copy())
+							}
+						}
+					}
+					// notify for all newly removed containers to existing pods
+					for name, oldContainer := range oldPod.Containers {
+						if _, ok := newPod.Containers[name]; !ok {
+							glog.V(5).Infof("Sync: Old container %s in pod %#v removed", name, k)
+							if oldContainer.Mount {
+								n.notifier.MountRemoved(oldContainer.Copy())
 							}
 						}
 					}
@@ -152,6 +163,7 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 						continue
 					}
 					for _, newContainer := range newPod.Containers {
+						glog.V(5).Infof("Sync: New container %s in new pod %#v", newContainer.ContainerName, k)
 						if newContainer.Mount {
 							n.notifier.MountAdded(newContainer.Copy())
 						}
@@ -199,19 +211,33 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 						info := kubernetesInfoForMap(event.Actor.Attributes)
 						info.ContainerID = event.Actor.ID
 						info.Created = event.Time
-						removed := n.containerCreated(n.pods, info, nil)
+						added, removed := n.containerCreated(n.pods, info, nil)
 						for _, remove := range removed {
 							if remove.Mount {
-								n.notifier.MountRemoved(remove)
+								n.notifier.MountRemoved(remove.Copy())
 							}
 						}
-						if info.Mount {
-							n.notifier.MountAdded(info)
+						// if this is newly added and has a mount, notify
+						if added {
+							glog.V(5).Infof("Added container %s to pod %s", info.ContainerName, info.PodUID)
+							if info.Mount {
+								n.notifier.MountAdded(info.Copy())
+							}
 						}
 					case "die":
 						info := kubernetesInfoForMap(event.Actor.Attributes)
 						if len(info.PodUID) > 0 && len(info.ContainerName) > 0 {
 							n.waitClear(info.PodUID, info.ContainerName)
+						}
+						// if this container was mounted, remove it
+						if pod, ok := n.pods[namespacedName{namespace: info.PodNamespace, name: info.PodName}]; ok {
+							if container, ok := pod.Containers[info.ContainerName]; ok {
+								glog.V(5).Infof("Removed container %s from pod %s", info.ContainerName, info.PodUID)
+								delete(pod.Containers, info.ContainerName)
+								if container.Mount {
+									n.notifier.MountRemoved(container.Copy())
+								}
+							}
 						}
 					default:
 						glog.V(5).Infof("Ignored container event %s", event.Action)
@@ -253,10 +279,10 @@ func kubernetesInfoForMap(attrs map[string]string) *notifier.ContainerInfo {
 	}
 }
 
-func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info *notifier.ContainerInfo, containerInfo *docker.APIContainers) (removed []*notifier.ContainerInfo) {
+func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info *notifier.ContainerInfo, containerInfo *docker.APIContainers) (added bool, removed []*notifier.ContainerInfo) {
 	// ignore containers that don't expose Kubernetes metadata
 	if len(info.PodUID) == 0 {
-		return removed
+		return false, removed
 	}
 	existing, ok := pods[namespacedName{namespace: info.PodNamespace, name: info.PodName}]
 	if ok {
@@ -264,7 +290,7 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 			// we already have seen this container and we're an older container, no need to check again
 			if oldContainer, ok := existing.Containers[info.ContainerName]; ok {
 				if info.Created <= oldContainer.Created {
-					return removed
+					return false, removed
 				}
 			}
 		} else {
@@ -286,7 +312,7 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 			if _, ok := err.(*docker.NoSuchContainer); !ok {
 				glog.Errorf("Unable to find container %q that was delivered via event: %v", info.ContainerID, err)
 			}
-			return removed
+			return false, removed
 		}
 		mount, ok = n.filter.IncludeContainer(container)
 	} else {
@@ -305,7 +331,11 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 		pods[namespacedName{namespace: info.PodNamespace, name: info.PodName}] = existing
 	}
 
+	newlyAdded := true
 	for _, existingContainer := range existing.Containers {
+		if existingContainer.ContainerName == info.ContainerName {
+			newlyAdded = false
+		}
 		if existingContainer.MountPath == mount {
 			// a container already has mounted this path, no need to add another
 			existingContainer.Mount = false
@@ -314,7 +344,7 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 
 	copied := *info
 	existing.Containers[info.ContainerName] = &copied
-	return removed
+	return newlyAdded, removed
 }
 
 func newestContainer(containers map[string]*notifier.ContainerInfo) int64 {

@@ -125,9 +125,17 @@ func (s *Server) MountRemoved(info *notifier.ContainerInfo) {
 	s.closeServer(name)
 }
 
+func (s *Server) newServer(info *notifier.ContainerInfo) *containerDirectoryWatcher {
+	return &containerDirectoryWatcher{
+		info:        info,
+		snapshotter: s.snapshotter,
+	}
+}
+
 func (s *Server) closeServer(name serverName) {
 	server, ok := s.servers[name]
 	if !ok {
+		glog.Infof("No server named %#v to be closed", name)
 		return
 	}
 	glog.Infof("Stopping server for container %s in pod %s", name.ContainerName, name.UID)
@@ -135,11 +143,4 @@ func (s *Server) closeServer(name serverName) {
 		glog.Errorf("Server shutdown reported error for container %s in pod %s: %v", name.ContainerName, name.UID, err)
 	}
 	delete(s.servers, name)
-}
-
-func (s *Server) newServer(info *notifier.ContainerInfo) *containerDirectoryWatcher {
-	return &containerDirectoryWatcher{
-		info:        info,
-		snapshotter: s.snapshotter,
-	}
 }

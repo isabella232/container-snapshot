@@ -26,6 +26,7 @@ type containerSnapshotTracker struct {
 	snapshotter notifier.ContainerSnapshotter
 	pending     chan containerConditionReached
 	work        chan struct{}
+	running     chan string
 	lock        sync.Mutex
 	operations  map[string]*containerSnapshotOp
 }
@@ -33,12 +34,15 @@ type containerSnapshotTracker struct {
 func newContainerSnapshotTracker(snapshotter notifier.ContainerSnapshotter) *containerSnapshotTracker {
 	return &containerSnapshotTracker{
 		snapshotter: snapshotter,
-		pending:     make(chan containerConditionReached, 10),
+		pending:     make(chan containerConditionReached, 5),
 		work:        make(chan struct{}, 1),
+		running:     make(chan string, 2),
 		operations:  make(map[string]*containerSnapshotOp),
 	}
 }
 
+// Run attempts to process the operations queue until stopCh is closed. It is safe to run
+// multiple snapshot trackers in parallel.
 func (c *containerSnapshotTracker) Run(stopCh <-chan struct{}) {
 	defer func() {
 		glog.V(4).Infof("Snapshot tracker exiting")
@@ -51,17 +55,17 @@ func (c *containerSnapshotTracker) Run(stopCh <-chan struct{}) {
 			c.ready(evt.PodUID, evt.ContainerName)
 		case <-c.work:
 			for {
-				op := c.next()
+				op := c.pop()
 				if op == nil {
 					glog.V(5).Infof("No work")
 					break
 				}
-				if ch := c.snapshotter.Wait(op.condition, op.podUID, op.fromContainer); ch != nil {
-					c.deferred(op, ch)
-					glog.V(5).Infof("Deferred %s in pod %s due to unsatisfied condition", op.fromContainer, op.podUID)
+				if ch := c.snapshotter.Wait(op.condition, op.podUID, op.containerName); ch != nil {
+					c.wait(op, ch)
+					glog.V(5).Infof("Deferred %s in pod %s due to unsatisfied condition", op.containerName, op.podUID)
 					continue
 				}
-				if err := c.runOnce(op); err != nil {
+				if err := c.run(op); err != nil {
 					glog.Errorf(err.Error())
 				}
 			}
@@ -69,37 +73,60 @@ func (c *containerSnapshotTracker) Run(stopCh <-chan struct{}) {
 	}
 }
 
-func (c *containerSnapshotTracker) runOnce(op *containerSnapshotOp) error {
-	defer func() {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-		op.completed = true
-	}()
-	return op.Run()
-}
-
-func (c *containerSnapshotTracker) deferred(op *containerSnapshotOp, ch <-chan struct{}) {
-	go func() {
-		<-ch
-		c.pending <- containerConditionReached{PodUID: op.podUID, ContainerName: op.fromContainer}
-	}()
-
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	op.pending = ch
-}
-
-func (c *containerSnapshotTracker) next() *containerSnapshotOp {
+// pop takes one snapshot op off the queue if it is not completed, not pending,
+// and not already running. It will return nil if the queue is empty
+func (c *containerSnapshotTracker) pop() *containerSnapshotOp {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	for _, op := range c.operations {
-		if !op.completed && op.pending == nil {
+		if !op.completed && !op.running && op.pending == nil {
+			op.running = true
 			return op
 		}
 	}
 	return nil
 }
 
+// run executes a snapshot operation, updating the op with the correct
+// state after it succeeds.
+func (c *containerSnapshotTracker) run(op *containerSnapshotOp) error {
+	// make sure someone doesn't accidentally invoke us with an op that is
+	// not running
+	c.lock.Lock()
+	if !op.running {
+		panic("snapshot op must be marked as running before calling run()")
+	}
+	c.lock.Unlock()
+
+	// ensure the operation is marked complete
+	defer func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+		op.running = false
+		op.completed = true
+	}()
+
+	return op.Run()
+}
+
+// wait sets the operation aside (not in the queue) until the provided channel is closed.
+func (c *containerSnapshotTracker) wait(op *containerSnapshotOp, ch <-chan struct{}) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if op.completed {
+		panic("should never call wait on a completed operation")
+	}
+	op.running = false
+	op.pending = ch
+
+	go func() {
+		<-ch
+		c.pending <- containerConditionReached{PodUID: op.podUID, ContainerName: op.containerName}
+	}()
+}
+
+// ready indicates that a given container should appear in the queue.
 func (c *containerSnapshotTracker) ready(podUID, containerName string) {
 	c.lock.Lock()
 	defer c.lock.Unlock()
@@ -125,9 +152,15 @@ func (c *containerSnapshotTracker) Sync(states []State, podUID, baseDir string) 
 
 	for _, state := range states {
 		if op, ok := c.operations[state.ContainerName]; ok {
-			glog.V(4).Infof("Container %s set to completed", state.ContainerName)
+			if op.running {
+				op.clear = false
+				continue
+			}
+			if state.Completed {
+				glog.V(4).Infof("Container %s set to completed", state.ContainerName)
+				op.completed = state.Completed
+			}
 			op.clear = false
-			op.completed = state.Completed
 			continue
 		}
 		op := newContainerSnapshotOp(c.snapshotter, podUID, state.ContainerName, state.Filename, baseDir, state.Condition)
@@ -141,10 +174,15 @@ func (c *containerSnapshotTracker) Sync(states []State, podUID, baseDir string) 
 	}
 
 	for name, op := range c.operations {
-		if op.clear {
-			glog.V(4).Infof("Container %s was removed from disk", name)
-			delete(c.operations, name)
+		if !op.clear {
+			continue
 		}
+		if op.running {
+			glog.V(4).Infof("Container %s was removed from disk but is still running", name)
+			continue
+		}
+		glog.V(4).Infof("Container %s was removed from disk", name)
+		delete(c.operations, name)
 	}
 
 	select {
