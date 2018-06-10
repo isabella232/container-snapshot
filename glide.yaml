@@ -1,0 +1,16 @@
+package: github.com/openshift/container-snapshot
+import:
+- package: github.com/MakeNowJust/heredoc
+- package: github.com/davecgh/go-spew
+  subpackages:
+  - spew
+- package: github.com/docker/docker
+  version: b68221c37ee597950364788204546f9c9d0e46a1
+  subpackages:
+  - pkg/archive
+- package: github.com/fsouza/go-dockerclient
+  repo:    git@github.com:openshift/go-dockerclient
+  version: openshift-3.9
+- package: github.com/golang/glog
+- package: github.com/spf13/cobra
+- package: github.com/spf13/pflag
