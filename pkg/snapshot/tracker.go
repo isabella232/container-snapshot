@@ -2,6 +2,7 @@ package snapshot
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"os"
@@ -9,65 +10,114 @@ import (
 	"sync"
 
 	"github.com/golang/glog"
+
+	"github.com/openshift/container-snapshot/pkg/notifier"
 )
 
 type State struct {
 	ContainerName string
+	Filename      string
 	Completed     bool
 	Pipe          bool
+	Condition     notifier.ConditionType
+}
+
+type containerConditionReached struct {
+	PodUID        string
+	ContainerName string
 }
 
 type containerSnapshotTracker struct {
-	snapshotter ContainerSnapshotter
+	snapshotter notifier.ContainerSnapshotter
+	pending     chan containerConditionReached
 	work        chan struct{}
 	lock        sync.Mutex
 	operations  map[string]*containerSnapshotOp
 }
 
-func newContainerSnapshotTracker(snapshotter ContainerSnapshotter) *containerSnapshotTracker {
+func newContainerSnapshotTracker(snapshotter notifier.ContainerSnapshotter) *containerSnapshotTracker {
 	return &containerSnapshotTracker{
 		snapshotter: snapshotter,
-		work:        make(chan struct{}),
+		pending:     make(chan containerConditionReached, 10),
+		work:        make(chan struct{}, 1),
 		operations:  make(map[string]*containerSnapshotOp),
 	}
 }
 
 func (c *containerSnapshotTracker) Run(stopCh <-chan struct{}) {
+	defer func() {
+		glog.V(4).Infof("Snapshot tracker exiting")
+	}()
 	for {
 		select {
 		case <-stopCh:
 			return
+		case evt := <-c.pending:
+			c.ready(evt.PodUID, evt.ContainerName)
 		case <-c.work:
-			if err := c.runOnce(); err != nil {
-				glog.Errorf(err.Error())
+			for {
+				op := c.next()
+				if op == nil {
+					glog.V(5).Infof("No work")
+					break
+				}
+				if ch := c.snapshotter.Wait(op.condition, op.podUID, op.fromContainer); ch != nil {
+					c.deferred(op, ch)
+					glog.V(5).Infof("Deferred %s in pod %s due to unsatisfied condition", op.fromContainer, op.podUID)
+					continue
+				}
+				if err := c.runOnce(op); err != nil {
+					glog.Errorf(err.Error())
+				}
 			}
 		}
 	}
 }
 
-func (c *containerSnapshotTracker) next() *containerSnapshotOp {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-	for _, op := range c.operations {
-		if op.completed {
-			continue
-		}
-		return op
-	}
-	return nil
-}
-
-func (c *containerSnapshotTracker) runOnce() error {
-	op := c.next()
-	if op == nil {
-		return nil
-	}
+func (c *containerSnapshotTracker) runOnce(op *containerSnapshotOp) error {
 	defer func() {
 		c.lock.Lock()
 		defer c.lock.Unlock()
 		op.completed = true
 	}()
 	return op.Run()
+}
+
+func (c *containerSnapshotTracker) deferred(op *containerSnapshotOp, ch <-chan struct{}) {
+	go func() {
+		<-ch
+		c.pending <- containerConditionReached{PodUID: op.podUID, ContainerName: op.fromContainer}
+	}()
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	op.pending = ch
+}
+
+func (c *containerSnapshotTracker) next() *containerSnapshotOp {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	for _, op := range c.operations {
+		if !op.completed && op.pending == nil {
+			return op
+		}
+	}
+	return nil
+}
+
+func (c *containerSnapshotTracker) ready(podUID, containerName string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if op, ok := c.operations[containerName]; ok {
+		if podUID != op.podUID {
+			panic(fmt.Sprintf("got unexpected podUID to this tracker (want %s, got %s)", podUID, op.podUID))
+		}
+		op.pending = nil
+	}
+	select {
+	case c.work <- struct{}{}:
+	default:
+	}
 }
 
 func (c *containerSnapshotTracker) Sync(states []State, podUID, baseDir string) error {
@@ -80,11 +130,12 @@ func (c *containerSnapshotTracker) Sync(states []State, podUID, baseDir string) 
 
 	for _, state := range states {
 		if op, ok := c.operations[state.ContainerName]; ok {
+			glog.V(4).Infof("Container %s set to completed", state.ContainerName)
 			op.clear = false
 			op.completed = state.Completed
 			continue
 		}
-		op := newContainerSnapshotOp(podUID, state.ContainerName, baseDir, c.snapshotter)
+		op := newContainerSnapshotOp(c.snapshotter, podUID, state.ContainerName, state.Filename, baseDir, state.Condition)
 		if state.Completed {
 			glog.V(4).Infof("Container %s has already been snapshotted", state.ContainerName)
 			op.completed = true
@@ -109,22 +160,27 @@ func (c *containerSnapshotTracker) Sync(states []State, podUID, baseDir string) 
 }
 
 type containerSnapshotOp struct {
+	snapshotter   notifier.ContainerSnapshotter
 	fromContainer string
 	podUID        string
+	filename      string
+	path          string
+	condition     notifier.ConditionType
 
-	path      string
+	// only used by the tracker while under its lock
 	clear     bool
 	completed bool
-
-	snapshotter ContainerSnapshotter
+	pending   <-chan struct{}
 }
 
-func newContainerSnapshotOp(podUID, fromContainer, path string, snapshotter ContainerSnapshotter) *containerSnapshotOp {
+func newContainerSnapshotOp(snapshotter notifier.ContainerSnapshotter, podUID, fromContainer, filename, path string, condition notifier.ConditionType) *containerSnapshotOp {
 	return &containerSnapshotOp{
-		fromContainer: fromContainer,
-		podUID:        podUID,
-		path:          path,
 		snapshotter:   snapshotter,
+		podUID:        podUID,
+		fromContainer: fromContainer,
+		filename:      filename,
+		path:          path,
+		condition:     condition,
 	}
 }
 
@@ -165,12 +221,12 @@ func (c *containerSnapshotOp) Run() error {
 }
 
 func (c *containerSnapshotOp) writeSnapshot() error {
-	path := filepath.Join(c.path, c.fromContainer)
+	path := filepath.Join(c.path, c.filename)
 	glog.V(4).Infof("Writing snapshot to %s", path)
 
 	var isNamedPipe bool
 	err := func() error {
-		in, err := c.snapshotter.Snapshot(c.podUID, c.fromContainer)
+		in, err := c.snapshotter.Snapshot(c.condition, c.podUID, c.fromContainer)
 		if err != nil {
 			return err
 		}

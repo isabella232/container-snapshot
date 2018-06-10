@@ -2,10 +2,8 @@ package docker
 
 import (
 	"fmt"
-	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/idtools"
-	"io"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
@@ -27,6 +25,37 @@ type podInfo struct {
 	Containers map[string]*notifier.ContainerInfo
 }
 
+type podWait struct {
+	podUID     string
+	containers []containerWait
+}
+
+func (w *podWait) compact() bool {
+	for i := 0; i < len(w.containers); {
+		if w.containers[i].ch != nil {
+			i++
+			continue
+		}
+		for j := i + 1; j < len(w.containers); j = i + 1 {
+			w.containers[i] = w.containers[j]
+			if w.containers[i].ch != nil {
+				i++
+			}
+		}
+		if w.containers[i].ch == nil {
+			w.containers = w.containers[:i]
+			break
+		}
+	}
+	return len(w.containers) == 0
+}
+
+type containerWait struct {
+	name      string
+	condition notifier.ConditionType
+	ch        chan struct{}
+}
+
 // dockerNotifier watches Docker events from the daemon, attempting to find containers that
 //
 //   1. Were created by Kubernetes and have the appropriate metadata
@@ -43,6 +72,9 @@ type dockerNotifier struct {
 	notifier     notifier.Containers
 	pods         map[namespacedName]*podInfo
 	syncInterval time.Duration
+
+	lock  sync.Mutex
+	waits map[string]*podWait
 }
 
 func New(client *docker.Client, n notifier.Containers) *dockerNotifier {
@@ -50,7 +82,9 @@ func New(client *docker.Client, n notifier.Containers) *dockerNotifier {
 		client:       client,
 		notifier:     n,
 		pods:         make(map[namespacedName]*podInfo),
-		syncInterval: time.Minute,
+		syncInterval: time.Minute / 4,
+
+		waits: make(map[string]*podWait),
 	}
 }
 
@@ -78,6 +112,7 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 					glog.Errorf("Unable to list containers: %v", err)
 					break
 				}
+
 				newPods := make(map[namespacedName]*podInfo)
 				newestContainer := int64(0)
 				for i := range containers {
@@ -134,6 +169,8 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 				}
 				n.pods = newPods
 
+				n.waitSync()
+
 				allMounts := make([]*notifier.ContainerInfo, 0, len(containers))
 				for _, newPod := range newPods {
 					for _, newContainer := range newPod.Containers {
@@ -185,62 +222,25 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 	return nil
 }
 
-func (n *dockerNotifier) Snapshot(podUID string, containerName string) (io.ReadCloser, error) {
-	glog.V(4).Infof("Snapshotting container %s in pod %s", containerName, podUID)
-	containers, err := n.client.ListContainers(docker.ListContainersOptions{Filters: map[string][]string{
+var errNoSuchContainer = fmt.Errorf("no container found in that pod")
+
+func (n *dockerNotifier) newestContainer(podUID, containerName string) (*docker.APIContainers, error) {
+	containers, err := n.client.ListContainers(docker.ListContainersOptions{All: true, Filters: map[string][]string{
 		"label": []string{
 			fmt.Sprintf("io.kubernetes.container.name=%s", containerName),
 			fmt.Sprintf("io.kubernetes.pod.uid=%s", podUID),
 		},
 	}})
 	if err != nil {
-		return nil, fmt.Errorf("unable to find containers to snapshot: %v", err)
+		return nil, fmt.Errorf("unable to find container %s in pod %s: %v", containerName, podUID, err)
 	}
 
 	if len(containers) == 0 {
-		return nil, fmt.Errorf("no container %s in pod %s", containerName, podUID)
+		return nil, errNoSuchContainer
 	}
 
 	// pick the newest
-	sort.Slice(containers, func(i, j int) bool {
-		a, b := containers[i], containers[j]
-		if a.Created >= b.Created {
-			return true
-		}
-		if a.ID < b.ID {
-			return true
-		}
-		return false
-	})
-
-	// locate an overlay2 filesystem
-	container, err := n.client.InspectContainer(containers[0].ID)
-	if err != nil {
-		return nil, fmt.Errorf("no container %s in pod %s: %v", containerName, podUID, err)
-	}
-	if container.GraphDriver == nil {
-		return nil, fmt.Errorf("cannot snapshot container, container runtime does not implement snapshotting")
-	}
-	if container.GraphDriver.Name != "overlay2" {
-		return nil, fmt.Errorf("cannot snapshot container, unsupported storage type %s", container.GraphDriver.Name)
-	}
-	path := container.GraphDriver.Data["UpperDir"]
-	if len(path) == 0 {
-		return nil, fmt.Errorf("cannot snapshot container, layer cannot be found")
-	}
-
-	// TODO: calculate these from the docker daemon
-	var uidMaps, gidMaps []idtools.IDMap
-
-	// stream the upper dir
-	glog.V(4).Infof("Streaming layer diff contents from %s", path)
-	return archive.TarWithOptions(path, &archive.TarOptions{
-		Compression:    archive.Gzip,
-		UIDMaps:        uidMaps,
-		GIDMaps:        gidMaps,
-		WhiteoutFormat: archive.OverlayWhiteoutFormat,
-	})
-
+	return newestAPIContainer(containers), nil
 }
 
 func kubernetesInfoForMap(attrs map[string]string) *notifier.ContainerInfo {
@@ -341,6 +341,18 @@ func newestContainer(containers map[string]*notifier.ContainerInfo) int64 {
 	for _, container := range containers {
 		if container != nil && container.Created > newest {
 			newest = container.Created
+		}
+	}
+	return newest
+}
+
+func newestAPIContainer(containers []docker.APIContainers) *docker.APIContainers {
+	t := int64(0)
+	var newest *docker.APIContainers
+	for i, container := range containers {
+		if container.Created >= t {
+			t = container.Created
+			newest = &containers[i]
 		}
 	}
 	return newest

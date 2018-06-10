@@ -27,7 +27,7 @@ type Server struct {
 	ListenCSIAddr     string
 	CSIStateDirectory string
 
-	snapshotter ContainerSnapshotter
+	snapshotter notifier.ContainerSnapshotter
 
 	lock    sync.Mutex
 	servers map[serverName]*containerDirectoryWatcher
@@ -125,10 +125,10 @@ func (s *Server) MountAdded(info *notifier.ContainerInfo) {
 	}
 	server := s.newServer(info)
 	s.servers[serverName{UID: info.PodUID, ContainerName: info.ContainerName}] = server
-	glog.Infof("Starting server for pod %s in namespace %s", info.PodName, info.PodNamespace)
+	glog.Infof("Starting server on container %s from pod %s in namespace %s", info.ContainerName, info.PodName, info.PodNamespace)
 	go func() {
 		if err := server.Serve(); err != nil {
-			glog.Errorf("Server startup failed for pod %s in namespace %s: %v", info.PodName, info.PodNamespace, err)
+			glog.Errorf("Server startup failed on container %s from pod %s in namespace %s: %v", info.ContainerName, info.PodName, info.PodNamespace, err)
 		}
 	}()
 }
@@ -162,7 +162,7 @@ func (s *Server) newServer(info *notifier.ContainerInfo) *containerDirectoryWatc
 type containerDirectoryWatcher struct {
 	info        *notifier.ContainerInfo
 	tracker     *containerSnapshotTracker
-	snapshotter ContainerSnapshotter
+	snapshotter notifier.ContainerSnapshotter
 
 	lock    sync.Mutex
 	stopCh  chan struct{}
@@ -205,9 +205,8 @@ func (s *containerDirectoryWatcher) Serve() error {
 }
 
 var (
-	validContainerNameRegexp       = regexp.MustCompile(`^[a-z0-9\-]+$`)
-	validContainerNameResultRegexp = regexp.MustCompile(`^[a-z0-9\-]+\.(json)$`)
-	resultFileSuffix               = ".json"
+	validContainerNameRegexp = regexp.MustCompile(`^[a-z0-9\-]+$`)
+	resultFileSuffix         = ".json"
 )
 
 // refresh observes the contents of a directory to determine what snapshots are requested
@@ -231,35 +230,63 @@ func (s *containerDirectoryWatcher) refresh(path string) error {
 	}
 
 	states := make([]State, 0, len(files))
+File:
 	for _, file := range files {
 		if file.IsDir() || file.Mode()&os.ModeSymlink == os.ModeSymlink {
 			continue
 		}
 
-		switch {
-		case validContainerNameRegexp.MatchString(file.Name()):
-			if file.Size() > 0 {
-				states = append(states, State{
-					ContainerName: file.Name(),
-					Completed:     true,
-				})
-				break
-			}
-			states = append(states, State{
-				ContainerName: file.Name(),
-				Pipe:          file.Mode()&os.ModeNamedPipe == os.ModeNamedPipe,
-			})
+		parts := strings.SplitN(file.Name(), ".", 3)
+		if len(parts) > 2 {
+			continue
+		}
+		name := parts[0]
+		parts = parts[1:]
+		if !validContainerNameRegexp.MatchString(name) {
+			continue
+		}
 
-		case validContainerNameResultRegexp.MatchString(file.Name()):
-			name := strings.TrimSuffix(file.Name(), resultFileSuffix)
+		switch {
+		// we process files in order, so the extension is always last
+		case len(parts) == 1 && parts[0] == "json":
 			if len(states) > 0 {
 				previous := len(states) - 1
 				if states[previous].ContainerName == name && !states[previous].Pipe {
 					glog.V(4).Infof("Container %s was not a pipe and has a status file, marking as complete", name)
 					states[previous].Completed = true
-					break
 				}
 			}
+
+		case len(states) > 0 && states[len(states)-1].ContainerName == name:
+			// if we see multiple versions of the container name, do nothing
+			glog.V(4).Infof("File %s ignored", file.Name())
+
+		default:
+			if file.Size() > 0 {
+				glog.V(4).Infof("Container %s was in a completed state", name)
+				states = append(states, State{
+					ContainerName: name,
+					Completed:     true,
+				})
+				break
+			}
+			condition := notifier.ConditionSuccess
+			if len(parts) > 0 {
+				switch s := notifier.ConditionType(parts[0]); s {
+				case notifier.ConditionFailed, notifier.ConditionDone, notifier.ConditionNode:
+					condition = s
+				default:
+					glog.V(4).Infof("Container %s had unrecognized condition %q", name, s)
+					continue File
+				}
+			}
+
+			states = append(states, State{
+				ContainerName: name,
+				Filename:      file.Name(),
+				Condition:     condition,
+				Pipe:          file.Mode()&os.ModeNamedPipe == os.ModeNamedPipe,
+			})
 		}
 	}
 
