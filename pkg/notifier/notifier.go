@@ -5,6 +5,7 @@ import (
 )
 
 type ContainerInfo struct {
+	Mount     bool
 	MountPath string
 
 	PodUID        string
@@ -30,7 +31,7 @@ type Containers interface {
 type ConditionType string
 
 const (
-	ConditionNode    ConditionType = "now"
+	ConditionNow     ConditionType = "now"
 	ConditionSuccess ConditionType = "success"
 	ConditionFailed  ConditionType = "failed"
 	ConditionDone    ConditionType = "done"

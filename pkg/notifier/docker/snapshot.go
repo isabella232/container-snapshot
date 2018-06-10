@@ -24,7 +24,7 @@ func (n *dockerNotifier) Snapshot(condition notifier.ConditionType, podUID strin
 	}
 
 	switch condition {
-	case notifier.ConditionNode:
+	case notifier.ConditionNow:
 	case notifier.ConditionDone:
 		if container.State.Running {
 			return nil, fmt.Errorf("container %s in pod %s is not done, possible wait error", containerName, podUID)
@@ -60,7 +60,10 @@ func (n *dockerNotifier) Snapshot(condition notifier.ConditionType, podUID strin
 	}
 
 	if _, err := os.Stat(path); err != nil {
-		return nil, fmt.Errorf("unable to snapshot container, the specified layer directory could not be located (verify you are running on the same filesystem as the container runtime): %v", err)
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("unable to snapshot container, the specified layer directory could not be located - verify you are running on the same filesystem as the container runtime")
+		}
+		return nil, fmt.Errorf("unable to snapshot container, the specified layer directory could not be located: %v", err)
 	}
 
 	// TODO: calculate these from the docker daemon

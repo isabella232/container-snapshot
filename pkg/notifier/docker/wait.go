@@ -6,6 +6,37 @@ import (
 	"github.com/openshift/container-snapshot/pkg/notifier"
 )
 
+type podWait struct {
+	podUID     string
+	containers []containerWait
+}
+
+func (w *podWait) compact() bool {
+	for i := 0; i < len(w.containers); {
+		if w.containers[i].ch != nil {
+			i++
+			continue
+		}
+		for j := i + 1; j < len(w.containers); j = i + 1 {
+			w.containers[i] = w.containers[j]
+			if w.containers[i].ch != nil {
+				i++
+			}
+		}
+		if w.containers[i].ch == nil {
+			w.containers = w.containers[:i]
+			break
+		}
+	}
+	return len(w.containers) == 0
+}
+
+type containerWait struct {
+	name      string
+	condition notifier.ConditionType
+	ch        chan struct{}
+}
+
 func (n *dockerNotifier) Wait(condition notifier.ConditionType, podUID, containerName string) <-chan struct{} {
 	// register for wait before we perform a live lookup, in case we race with our
 	// event or sync loops
@@ -31,7 +62,7 @@ func (n *dockerNotifier) Wait(condition notifier.ConditionType, podUID, containe
 func containerStateSatisfied(state string, condition notifier.ConditionType) bool {
 	glog.V(6).Infof("Checking container state %s", state)
 	switch {
-	case condition == notifier.ConditionNode:
+	case condition == notifier.ConditionNow:
 		return true
 	case condition == notifier.ConditionDone, condition == notifier.ConditionFailed, condition == notifier.ConditionSuccess:
 		switch state {
@@ -42,6 +73,27 @@ func containerStateSatisfied(state string, condition notifier.ConditionType) boo
 		}
 	default:
 		return true
+	}
+}
+
+func (n *dockerNotifier) waitClear(podUID, containerName string) {
+	n.lock.Lock()
+	defer n.lock.Unlock()
+
+	wait, ok := n.waits[podUID]
+	if !ok {
+		return
+	}
+
+	for i, c := range wait.containers {
+		if c.name == containerName && c.ch != nil {
+			glog.V(4).Infof("Satisfied condition %q on %s in pod %s due to termination event", c.condition, c.name, podUID)
+			close(c.ch)
+			wait.containers[i].ch = nil
+		}
+	}
+	if wait.compact() {
+		delete(n.waits, podUID)
 	}
 }
 

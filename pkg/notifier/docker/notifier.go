@@ -13,6 +13,11 @@ import (
 	"github.com/openshift/container-snapshot/pkg/notifier"
 )
 
+type ContainerFilter interface {
+	IncludeAPIContainer(*docker.APIContainers) (mountPath string, ok bool)
+	IncludeContainer(*docker.Container) (mountPath string, ok bool)
+}
+
 type namespacedName struct {
 	namespace string
 	name      string
@@ -23,37 +28,6 @@ type podInfo struct {
 	Name       string
 	UID        string
 	Containers map[string]*notifier.ContainerInfo
-}
-
-type podWait struct {
-	podUID     string
-	containers []containerWait
-}
-
-func (w *podWait) compact() bool {
-	for i := 0; i < len(w.containers); {
-		if w.containers[i].ch != nil {
-			i++
-			continue
-		}
-		for j := i + 1; j < len(w.containers); j = i + 1 {
-			w.containers[i] = w.containers[j]
-			if w.containers[i].ch != nil {
-				i++
-			}
-		}
-		if w.containers[i].ch == nil {
-			w.containers = w.containers[:i]
-			break
-		}
-	}
-	return len(w.containers) == 0
-}
-
-type containerWait struct {
-	name      string
-	condition notifier.ConditionType
-	ch        chan struct{}
 }
 
 // dockerNotifier watches Docker events from the daemon, attempting to find containers that
@@ -69,6 +43,7 @@ type containerWait struct {
 //       a notification
 type dockerNotifier struct {
 	client       *docker.Client
+	filter       ContainerFilter
 	notifier     notifier.Containers
 	pods         map[namespacedName]*podInfo
 	syncInterval time.Duration
@@ -77,9 +52,10 @@ type dockerNotifier struct {
 	waits map[string]*podWait
 }
 
-func New(client *docker.Client, n notifier.Containers) *dockerNotifier {
+func New(client *docker.Client, n notifier.Containers, f ContainerFilter) *dockerNotifier {
 	return &dockerNotifier{
 		client:       client,
+		filter:       f,
 		notifier:     n,
 		pods:         make(map[namespacedName]*podInfo),
 		syncInterval: time.Minute / 4,
@@ -134,27 +110,39 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 					if !ok {
 						// the entire pod has been removed, remove all containers
 						for _, oldContainer := range oldPod.Containers {
-							n.notifier.MountRemoved(oldContainer.Copy())
+							if oldContainer.Mount {
+								n.notifier.MountRemoved(oldContainer.Copy())
+							}
 						}
 						continue
 					}
 					// update any containers where mount path or pod UID changed
 					for name, oldContainer := range oldPod.Containers {
 						if newContainer, ok := newPod.Containers[name]; ok {
-							if newContainer.MountPath == oldContainer.MountPath && newContainer.PodUID == oldContainer.PodUID {
+							if newContainer.Mount == oldContainer.Mount &&
+								newContainer.MountPath == oldContainer.MountPath &&
+								newContainer.PodUID == oldContainer.PodUID {
 								continue
 							}
 							glog.V(4).Infof("Refresh pod %s/%s container %s (%s -> %s)", newContainer.PodNamespace, newContainer.PodName, newContainer.ContainerName, oldContainer.MountPath, newContainer.MountPath)
-							n.notifier.MountRemoved(oldContainer.Copy())
-							n.notifier.MountAdded(newContainer.Copy())
+							if oldContainer.Mount {
+								n.notifier.MountRemoved(oldContainer.Copy())
+							}
+							if newContainer.Mount {
+								n.notifier.MountAdded(newContainer.Copy())
+							}
 						} else {
-							n.notifier.MountRemoved(oldContainer.Copy())
+							if oldContainer.Mount {
+								n.notifier.MountRemoved(oldContainer.Copy())
+							}
 						}
 					}
 					// notify for all newly added containers to existing pods
 					for name, newContainer := range newPod.Containers {
 						if _, ok := oldPod.Containers[name]; !ok {
-							n.notifier.MountAdded(newContainer.Copy())
+							if newContainer.Mount {
+								n.notifier.MountAdded(newContainer.Copy())
+							}
 						}
 					}
 				}
@@ -164,7 +152,9 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 						continue
 					}
 					for _, newContainer := range newPod.Containers {
-						n.notifier.MountAdded(newContainer.Copy())
+						if newContainer.Mount {
+							n.notifier.MountAdded(newContainer.Copy())
+						}
 					}
 				}
 				n.pods = newPods
@@ -174,7 +164,9 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 				allMounts := make([]*notifier.ContainerInfo, 0, len(containers))
 				for _, newPod := range newPods {
 					for _, newContainer := range newPod.Containers {
-						allMounts = append(allMounts, newContainer.Copy())
+						if newContainer.Mount {
+							allMounts = append(allMounts, newContainer.Copy())
+						}
 					}
 				}
 				sort.SliceStable(allMounts, func(i, j int) bool {
@@ -207,13 +199,22 @@ func (n *dockerNotifier) Run(stopCh <-chan struct{}) error {
 						info := kubernetesInfoForMap(event.Actor.Attributes)
 						info.ContainerID = event.Actor.ID
 						info.Created = event.Time
-						added, removed := n.containerCreated(n.pods, info, nil)
+						removed := n.containerCreated(n.pods, info, nil)
 						for _, remove := range removed {
-							n.notifier.MountRemoved(remove)
+							if remove.Mount {
+								n.notifier.MountRemoved(remove)
+							}
 						}
-						if added {
+						if info.Mount {
 							n.notifier.MountAdded(info)
 						}
+					case "die":
+						info := kubernetesInfoForMap(event.Actor.Attributes)
+						if len(info.PodUID) > 0 && len(info.ContainerName) > 0 {
+							n.waitClear(info.PodUID, info.ContainerName)
+						}
+					default:
+						glog.V(5).Infof("Ignored container event %s", event.Action)
 					}
 				}
 			}
@@ -252,10 +253,10 @@ func kubernetesInfoForMap(attrs map[string]string) *notifier.ContainerInfo {
 	}
 }
 
-func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info *notifier.ContainerInfo, containerInfo *docker.APIContainers) (added bool, removed []*notifier.ContainerInfo) {
+func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info *notifier.ContainerInfo, containerInfo *docker.APIContainers) (removed []*notifier.ContainerInfo) {
 	// ignore containers that don't expose Kubernetes metadata
 	if len(info.PodUID) == 0 {
-		return false, removed
+		return removed
 	}
 	existing, ok := pods[namespacedName{namespace: info.PodNamespace, name: info.PodName}]
 	if ok {
@@ -263,7 +264,7 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 			// we already have seen this container and we're an older container, no need to check again
 			if oldContainer, ok := existing.Containers[info.ContainerName]; ok {
 				if info.Created <= oldContainer.Created {
-					return false, removed
+					return removed
 				}
 			}
 		} else {
@@ -285,15 +286,13 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 			if _, ok := err.(*docker.NoSuchContainer); !ok {
 				glog.Errorf("Unable to find container %q that was delivered via event: %v", info.ContainerID, err)
 			}
-			return false, removed
+			return removed
 		}
-		mount, ok = findKubernetesMountDir(container)
+		mount, ok = n.filter.IncludeContainer(container)
 	} else {
-		mount, ok = findKubernetesAPIMountDir(containerInfo)
+		mount, ok = n.filter.IncludeAPIContainer(containerInfo)
 	}
-	if !ok {
-		return false, removed
-	}
+	info.Mount = ok
 	info.MountPath = mount
 
 	if existing == nil {
@@ -309,31 +308,13 @@ func (n *dockerNotifier) containerCreated(pods map[namespacedName]*podInfo, info
 	for _, existingContainer := range existing.Containers {
 		if existingContainer.MountPath == mount {
 			// a container already has mounted this path, no need to add another
-			return false, removed
+			existingContainer.Mount = false
 		}
 	}
 
 	copied := *info
 	existing.Containers[info.ContainerName] = &copied
-	return true, removed
-}
-
-func findKubernetesMountDir(container *docker.Container) (path string, ok bool) {
-	for _, mount := range container.Mounts {
-		if mount.Destination == "/var/run/container-snapshot.openshift.io" && mount.RW {
-			return mount.Source, true
-		}
-	}
-	return "", false
-}
-
-func findKubernetesAPIMountDir(container *docker.APIContainers) (path string, ok bool) {
-	for _, mount := range container.Mounts {
-		if mount.Destination == "/var/run/container-snapshot.openshift.io" && mount.RW {
-			return mount.Source, true
-		}
-	}
-	return "", false
+	return removed
 }
 
 func newestContainer(containers map[string]*notifier.ContainerInfo) int64 {

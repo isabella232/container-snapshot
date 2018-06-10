@@ -31,7 +31,7 @@ func New(name string) *cobra.Command {
 
 			When running with Docker, bind mount the /var/run/container-snapshot.openshift.io directory
 			(writable) and then create an empty file in that directory that has the same name as
-			a container in the namespace. The daemon will write a gzipped and tarred Docker layer
+			a container in the pod. The daemon will write a gzipped and tarred Docker layer
 			diff archive to that location. You may also create a named pipe with "mkfifo" and read
 			from the pipe to stream contents without hitting disk.`),
 		RunE: func(c *cobra.Command, args []string) error {
